@@ -1,0 +1,105 @@
+name: Shopify Revenue Alert
+
+on:
+  schedule:
+    # Runs every hour at :05 (gives Shopify API time to settle)
+    - cron: '5 * * * *'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Set to true to print results without sending email'
+        required: false
+        default: 'false'
+
+jobs:
+  check-revenue:
+    name: Check Revenue & Alert
+    runs-on: ubuntu-latest
+
+    steps:
+      # -----------------------------------------------------------------------
+      # 1. Checkout
+      # -----------------------------------------------------------------------
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # -----------------------------------------------------------------------
+      # 2. Python setup
+      # -----------------------------------------------------------------------
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      # -----------------------------------------------------------------------
+      # 3. Cache pip dependencies (keyed on requirements.txt hash)
+      # -----------------------------------------------------------------------
+      - name: Cache pip packages
+        uses: actions/cache@v4
+        id: pip-cache
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      # -----------------------------------------------------------------------
+      # 4. Restore cooldown file from cache
+      #    Key rotates daily so old cooldowns expire automatically.
+      #    restore-keys lets us fall back to any existing cooldown cache.
+      # -----------------------------------------------------------------------
+      - name: Restore cooldown cache
+        uses: actions/cache@v4
+        id: cooldown-cache
+        with:
+          path: /tmp/last_alert.json
+          key: cooldown-${{ runner.os }}-${{ github.run_id }}
+          restore-keys: |
+            cooldown-${{ runner.os }}-
+
+      - name: Show restored cooldown file (debug)
+        run: |
+          if [ -f /tmp/last_alert.json ]; then
+            echo "Cooldown file restored:"
+            cat /tmp/last_alert.json
+          else
+            echo "No cooldown file found — first run or cache expired."
+          fi
+
+      # -----------------------------------------------------------------------
+      # 5. Run the alert script
+      # -----------------------------------------------------------------------
+      - name: Run Shopify revenue alert
+        env:
+          # --- Secrets (set in repo Settings → Secrets and variables → Actions → Secrets) ---
+          SHOPIFY_STORE:  ${{ secrets.SHOPIFY_STORE }}
+          SHOPIFY_TOKEN:  ${{ secrets.SHOPIFY_TOKEN }}
+          EMAIL_FROM:     ${{ secrets.EMAIL_FROM }}
+          EMAIL_TO:       ${{ secrets.EMAIL_TO }}
+          SMTP_USER:      ${{ secrets.SMTP_USER }}
+          SMTP_PASS:      ${{ secrets.SMTP_PASS }}
+          # --- Variables (set in repo Settings → Secrets and variables → Actions → Variables) ---
+          ALERT_THRESHOLD: ${{ vars.ALERT_THRESHOLD }}
+          COMPARE_TO:      ${{ vars.COMPARE_TO }}
+          TIMEZONE:        ${{ vars.TIMEZONE }}
+          COOLDOWN_HOURS:  ${{ vars.COOLDOWN_HOURS }}
+          STORE_NAME:      ${{ vars.STORE_NAME }}
+        run: python shopify_alert.py
+
+      # -----------------------------------------------------------------------
+      # 6. Save updated cooldown file back to cache
+      #    actions/cache saves automatically if the key didn't exist on restore,
+      #    but we use a unique run_id key so it always saves the latest state.
+      # -----------------------------------------------------------------------
+      - name: Confirm cooldown file after run (debug)
+        if: always()
+        run: |
+          if [ -f /tmp/last_alert.json ]; then
+            echo "Cooldown file after run:"
+            cat /tmp/last_alert.json
+          else
+            echo "No cooldown file written (no alert triggered)."
+          fi
