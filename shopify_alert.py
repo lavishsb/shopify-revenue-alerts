@@ -124,15 +124,34 @@ def get_last_completed_hour(tz: pytz.BaseTzInfo) -> tuple[datetime, datetime]:
 
 
 def get_comparison_window(current_start: datetime, compare_to: str) -> tuple[datetime, datetime]:
-    """Returns the same 1-hour window shifted by -1 day or -7 days."""
+    """
+    Returns the same 1-hour window on the reference day.
+    compare_to accepts:
+      - 'yesterday'   → 1 day ago (default)
+      - 'last_week'   → 7 days ago
+      - 't-N'         → N days ago  (e.g. 't-3')
+      - 'YYYY-MM-DD'  → specific date, same hour
+    """
     if compare_to == "last_week":
         delta = timedelta(weeks=1)
-    else:  # default: yesterday
-        delta = timedelta(days=1)
+    elif compare_to.lower().startswith("t-"):
+        try:
+            days = int(compare_to[2:])
+        except ValueError:
+            raise ValueError(f"Invalid COMPARE_TO '{compare_to}'. Expected format: t-N (e.g. t-3)")
+        delta = timedelta(days=days)
+    else:
+        try:
+            ref_date = datetime.strptime(compare_to, "%Y-%m-%d").date()
+            ref_start = current_start.replace(
+                year=ref_date.year, month=ref_date.month, day=ref_date.day
+            )
+            return ref_start, ref_start + timedelta(hours=1)
+        except ValueError:
+            delta = timedelta(days=1)  # fallback: yesterday
 
     ref_start = current_start - delta
-    ref_end   = ref_start + timedelta(hours=1)
-    return ref_start, ref_end
+    return ref_start, ref_start + timedelta(hours=1)
 
 
 # ---------------------------------------------------------------------------
