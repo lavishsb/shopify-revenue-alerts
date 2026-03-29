@@ -2,6 +2,7 @@
 Shopify Revenue Alert System
 Compares current hour revenue vs same hour yesterday/last_week.
 Sends HTML email alert via Gmail SMTP if revenue drops by X%.
+Also shows Orders, AOV, and Sessions in the email body.
 """
 
 import os
@@ -36,7 +37,7 @@ SMTP_USER         = os.environ["SMTP_USER"]
 SMTP_PASS         = os.environ["SMTP_PASS"]
 
 ALERT_THRESHOLD   = float(os.environ.get("ALERT_THRESHOLD", "20"))   # % drop
-COMPARE_TO        = os.environ.get("COMPARE_TO", "yesterday")        # yesterday | last_week
+COMPARE_TO        = os.environ.get("COMPARE_TO", "yesterday")        # yesterday | last_week | t-N | YYYY-MM-DD
 TIMEZONE          = os.environ.get("TIMEZONE", "Asia/Kolkata")
 COOLDOWN_HOURS    = float(os.environ.get("COOLDOWN_HOURS", "2"))
 STORE_NAME        = os.environ.get("STORE_NAME", SHOPIFY_STORE)
@@ -109,6 +110,52 @@ def _parse_next_link(link_header: str) -> str | None:
 
 def calc_revenue(orders: list[dict]) -> float:
     return sum(float(o.get("total_price", 0)) for o in orders)
+
+
+def fetch_sessions_for_window(start: datetime, end: datetime) -> int | None:
+    """
+    Fetch session count for the given window via Shopify GraphQL ShopifyQL API.
+    Requires read_analytics scope. Returns None on any failure.
+    """
+    url = f"https://{SHOPIFY_STORE}/admin/api/{API_VERSION}/graphql.json"
+    since = start.isoformat()
+    until = end.isoformat()
+    graphql_query = """
+    {
+      shopifyqlQuery(query: "FROM sessions SINCE '%s' UNTIL '%s' SELECT sessions") {
+        parseErrors { code message }
+        tableData {
+          rowData
+          columns { name dataType }
+        }
+      }
+    }
+    """ % (since, until)
+
+    try:
+        resp = requests.post(
+            url,
+            headers=_shopify_headers(),
+            json={"query": graphql_query},
+            timeout=30,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+
+        ql = data.get("data", {}).get("shopifyqlQuery", {})
+        parse_errors = ql.get("parseErrors", [])
+        if parse_errors:
+            log.warning("ShopifyQL parse errors: %s", parse_errors)
+            return None
+
+        table = ql.get("tableData")
+        if not table or not table.get("rowData"):
+            return 0
+
+        return int(table["rowData"][0][0])
+    except Exception as exc:
+        log.warning("Failed to fetch sessions: %s", exc)
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -196,7 +243,7 @@ def record_alert(window_key: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Email
+# Email helpers
 # ---------------------------------------------------------------------------
 
 def _fmt_window(start: datetime, end: datetime) -> str:
@@ -208,14 +255,48 @@ def _fmt_inr(amount: float) -> str:
     return f"₹{amount:,.2f}"
 
 
+def _pct_change(current: float, reference: float) -> float | None:
+    if reference == 0:
+        return None
+    return ((current - reference) / reference) * 100
+
+
+def _fmt_change_html(pct: float | None) -> str:
+    if pct is None:
+        return "<span style='color:#888'>N/A</span>"
+    color = "#27ae60" if pct >= 0 else "#d93025"
+    arrow = "▲" if pct >= 0 else "▼"
+    return f'<span style="color:{color};font-weight:bold">{arrow} {abs(pct):.1f}%</span>'
+
+
 def build_html_email(
-    current_start: datetime, current_end: datetime, current_rev: float,
-    ref_start: datetime, ref_end: datetime, ref_rev: float,
+    current_start: datetime, current_end: datetime,
+    ref_start: datetime, ref_end: datetime,
+    curr_rev: float, ref_rev: float,
+    curr_orders: int, ref_orders: int,
+    curr_sessions: int | None, ref_sessions: int | None,
     drop_pct: float,
     sent_at: datetime,
 ) -> str:
-    drop_color = "#d93025"  # red
     threshold_note = f"{ALERT_THRESHOLD:.0f}%"
+
+    curr_aov = curr_rev / curr_orders if curr_orders > 0 else 0.0
+    ref_aov  = ref_rev  / ref_orders  if ref_orders  > 0 else 0.0
+
+    rev_change   = _pct_change(curr_rev,      ref_rev)
+    order_change = _pct_change(curr_orders,   ref_orders)
+    aov_change   = _pct_change(curr_aov,      ref_aov)
+    sess_change  = _pct_change(curr_sessions, ref_sessions) if curr_sessions is not None and ref_sessions is not None else None
+
+    sessions_row = ""
+    if curr_sessions is not None:
+        sessions_row = f"""
+      <tr>
+        <td><strong>Sessions</strong></td>
+        <td>{curr_sessions:,}</td>
+        <td>{ref_sessions:,}</td>
+        <td>{_fmt_change_html(sess_change)}</td>
+      </tr>"""
 
     return f"""<!DOCTYPE html>
 <html lang="en">
@@ -224,56 +305,61 @@ def build_html_email(
 <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
 <style>
   body      {{ font-family: Arial, sans-serif; background: #f4f4f4; margin: 0; padding: 20px; }}
-  .card     {{ background: #ffffff; border-radius: 8px; max-width: 620px;
+  .card     {{ background: #ffffff; border-radius: 8px; max-width: 680px;
                margin: 0 auto; padding: 30px; box-shadow: 0 2px 8px rgba(0,0,0,0.1); }}
   h2        {{ color: #d93025; margin-top: 0; }}
+  .windows  {{ font-size: 13px; color: #555; margin-bottom: 16px; }}
   table     {{ width: 100%; border-collapse: collapse; margin-top: 16px; }}
   th        {{ background: #f0f0f0; text-align: left; padding: 10px 12px;
                font-size: 13px; color: #555; border: 1px solid #ddd; }}
   td        {{ padding: 10px 12px; border: 1px solid #ddd; font-size: 14px; }}
-  .drop     {{ color: {drop_color}; font-weight: bold; font-size: 18px; }}
-  .footer   {{ margin-top: 24px; font-size: 12px; color: #888; text-align: center; }}
   .badge    {{ display: inline-block; background: #fff3f3; border: 1px solid #d93025;
                border-radius: 4px; padding: 2px 8px; color: #d93025;
                font-weight: bold; font-size: 13px; }}
+  .footer   {{ margin-top: 24px; font-size: 12px; color: #888; text-align: center; }}
 </style>
 </head>
 <body>
 <div class="card">
   <h2>⚠️ Revenue Drop Alert — {STORE_NAME}</h2>
   <p>
-    Revenue has dropped by <span class="badge">{drop_pct:.1f}%</span>, exceeding the
+    Revenue has dropped by <span class="badge">▼ {drop_pct:.1f}%</span>, exceeding the
     configured threshold of <strong>{threshold_note}</strong>.
   </p>
+
+  <div class="windows">
+    <strong>Current window&nbsp;&nbsp;:</strong> {_fmt_window(current_start, current_end)}<br/>
+    <strong>Reference window :</strong> {_fmt_window(ref_start, ref_end)}
+  </div>
 
   <table>
     <thead>
       <tr>
         <th>Metric</th>
-        <th>Value</th>
+        <th>Current Hour</th>
+        <th>Reference Hour</th>
+        <th>Change</th>
       </tr>
     </thead>
     <tbody>
       <tr>
-        <td><strong>Current Hour Window</strong></td>
-        <td>{_fmt_window(current_start, current_end)}</td>
-      </tr>
-      <tr>
-        <td><strong>Current Hour Revenue</strong></td>
-        <td><strong>{_fmt_inr(current_rev)}</strong></td>
-      </tr>
-      <tr>
-        <td><strong>Comparison Window ({COMPARE_TO.replace("_", " ")})</strong></td>
-        <td>{_fmt_window(ref_start, ref_end)}</td>
-      </tr>
-      <tr>
-        <td><strong>Comparison Revenue</strong></td>
+        <td><strong>Revenue</strong></td>
+        <td><strong>{_fmt_inr(curr_rev)}</strong></td>
         <td>{_fmt_inr(ref_rev)}</td>
+        <td>{_fmt_change_html(rev_change)}</td>
       </tr>
       <tr>
-        <td><strong>Revenue Drop</strong></td>
-        <td><span class="drop">▼ {drop_pct:.1f}%</span></td>
+        <td><strong>Orders</strong></td>
+        <td>{curr_orders:,}</td>
+        <td>{ref_orders:,}</td>
+        <td>{_fmt_change_html(order_change)}</td>
       </tr>
+      <tr>
+        <td><strong>AOV</strong></td>
+        <td>{_fmt_inr(curr_aov)}</td>
+        <td>{_fmt_inr(ref_aov)}</td>
+        <td>{_fmt_change_html(aov_change)}</td>
+      </tr>{sessions_row}
     </tbody>
   </table>
 
@@ -322,18 +408,29 @@ def main() -> None:
         log.info("Within cooldown period for %s — skipping.", window_key)
         return
 
-    # 3. Fetch revenue
+    # 3. Fetch orders (both windows)
     log.info("Fetching current hour orders…")
-    curr_orders = fetch_orders_for_window(curr_start, curr_end)
-    curr_rev    = calc_revenue(curr_orders)
-    log.info("Current revenue : ₹%.2f (%d orders)", curr_rev, len(curr_orders))
+    curr_orders_data = fetch_orders_for_window(curr_start, curr_end)
+    curr_rev         = calc_revenue(curr_orders_data)
+    curr_orders      = len(curr_orders_data)
+    log.info("Current  : ₹%.2f, %d orders", curr_rev, curr_orders)
 
     log.info("Fetching comparison hour orders…")
-    ref_orders  = fetch_orders_for_window(ref_start, ref_end)
-    ref_rev     = calc_revenue(ref_orders)
-    log.info("Reference revenue: ₹%.2f (%d orders)", ref_rev, len(ref_orders))
+    ref_orders_data  = fetch_orders_for_window(ref_start, ref_end)
+    ref_rev          = calc_revenue(ref_orders_data)
+    ref_orders       = len(ref_orders_data)
+    log.info("Reference: ₹%.2f, %d orders", ref_rev, ref_orders)
 
-    # 4. Calculate drop
+    # 4. Fetch sessions (both windows)
+    log.info("Fetching current hour sessions…")
+    curr_sessions = fetch_sessions_for_window(curr_start, curr_end)
+    log.info("Current sessions : %s", curr_sessions)
+
+    log.info("Fetching reference hour sessions…")
+    ref_sessions = fetch_sessions_for_window(ref_start, ref_end)
+    log.info("Reference sessions: %s", ref_sessions)
+
+    # 5. Calculate revenue drop
     if ref_rev == 0:
         log.warning("Reference revenue is ₹0 — cannot calculate drop. Skipping alert.")
         return
@@ -345,21 +442,24 @@ def main() -> None:
         log.info("No alert needed (drop %.2f%% < threshold %.0f%%).", drop_pct, ALERT_THRESHOLD)
         return
 
-    # 5. Send alert
+    # 6. Send alert
     log.warning("ALERT: Revenue dropped %.2f%% — sending email.", drop_pct)
-    sent_at   = datetime.now(tz)
-    subject   = (
+    sent_at = datetime.now(tz)
+    subject = (
         f"⚠️ [{STORE_NAME}] Revenue Alert: ▼{drop_pct:.1f}% drop "
         f"at {curr_start.strftime('%I %p %Z')}"
     )
     html_body = build_html_email(
-        curr_start, curr_end, curr_rev,
-        ref_start,  ref_end,  ref_rev,
+        curr_start, curr_end,
+        ref_start, ref_end,
+        curr_rev, ref_rev,
+        curr_orders, ref_orders,
+        curr_sessions, ref_sessions,
         drop_pct, sent_at,
     )
     send_email(subject, html_body)
 
-    # 6. Record cooldown
+    # 7. Record cooldown
     record_alert(window_key)
     log.info("Done.")
 
