@@ -118,8 +118,8 @@ def fetch_sessions_for_window(start: datetime, end: datetime) -> int | None:
     Requires read_analytics scope. Returns None on any failure.
     """
     url = f"https://{SHOPIFY_STORE}/admin/api/{API_VERSION}/graphql.json"
-    since = start.isoformat()
-    until = end.isoformat()
+    since = start.astimezone(pytz.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    until = end.astimezone(pytz.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     graphql_query = """
     {
       shopifyqlQuery(query: "FROM sessions SINCE '%s' UNTIL '%s' SELECT sessions") {
